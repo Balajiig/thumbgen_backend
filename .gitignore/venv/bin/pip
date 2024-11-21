@@ -1,6 +1,4 @@
-#!/bin/sh
-'''exec' "/home/sonic/Documents/YB One/Child Product /FastAPI/thumbgen_backend/venv/bin/python3" "$0" "$@"
-' '''
+#!/home/sonic/Documents/YBOne/ChildProduct/FastAPI/thumbgen_backend/venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys
