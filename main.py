@@ -3,6 +3,11 @@ from pydantic import BaseModel
 import requests
 import re
 from io import BytesIO
+import spacy
+from transformers import pipeline
+
+# Load spaCy NLP model
+nlp = spacy.load("en_core_web_sm")
 
 # YouTube API Configuration
 YOUTUBE_API_KEY = "AIzaSyAAea1lUcPM7BYQmJPC-jpkUzmXocbvBIM"  # Replace with your YouTube API Key
@@ -68,27 +73,50 @@ def fetch_youtube_metadata(youtube_url):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error processing YouTube URL: {str(e)}")
 
-# Helper function to summarize text using Hugging Face API
-def summarize_text(text):
-    headers = {"Authorization": f"Bearer {HUGGING_FACE_API_KEY}"}
-    payload = {"inputs": text}
-    response = requests.post(HUGGING_FACE_API_URL_SUMMARY, headers=headers, json=payload)
-    if response.status_code == 200:
-        return response.json()[0]["summary_text"]
-    else:
-        raise HTTPException(status_code=500, detail="Error summarizing the text using Hugging Face API.")
+
+
+# Function to summarize and generate prompts
+def summarize_text_to_prompt(description):
+    """
+    Summarize a text and convert it into a structured image prompt.
+    """
+    # Step 1: Extract keyphrases using spaCy
+    doc = nlp(description)
+    key_phrases = [chunk.text for chunk in doc.noun_chunks if len(chunk.text.split()) > 1][:3]  # Limit to top 3 phrases
+
+    # Step 2: Generate a short summary (optional)
+    summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+    summary = summarizer(description, max_length=50, min_length=10, do_sample=False)[0]['summary_text']
+
+    # Step 3: Convert to a structured prompt
+    prompt = {
+        "foreground": f"A visually striking depiction of {key_phrases[0]}",
+        "background": f"Complementary setting with elements related to {key_phrases[1]}",
+        "bold_text": summary,
+    }
+
+    return prompt
 
 # Helper function to generate image using Hugging Face API
 def generate_image(prompt):
+    """
+    Generate an image using a structured prompt.
+    """
     headers = {"Authorization": f"Bearer {HUGGING_FACE_API_KEY}"}
-    payload = {"inputs": prompt}
+
+    # Create descriptive prompt text
+    input_prompt = (
+        f"A visually stunning image with the following details:\n"
+        f"Foreground: {prompt['foreground']}.\n"
+        f"Background: {prompt['background']}.\n"
+        f"Bold Text: '{prompt['bold_text']}' prominently displayed in the middle."
+    )
+    payload = {"inputs": input_prompt}
     response = requests.post(HUGGING_FACE_API_URL_IMAGE, headers=headers, json=payload)
-    
+
     if response.status_code == 200:
-        image_data = response.content
-        return image_data
+        return response.content
     else:
-        print("Error response from Hugging Face API:", response.json())
         raise HTTPException(status_code=500, detail="Error generating the image using Hugging Face API.")
 
 # POST endpoint to process YouTube URL
@@ -98,7 +126,7 @@ def process_youtube_url(data: YouTubeURL):
     metadata = fetch_youtube_metadata(data.url)
 
     # Step 2: Summarize description
-    summarized_content = summarize_text(metadata["description"])
+    summarized_content = summarize_text_to_prompt(metadata["description"])
     
     print(summarized_content)
     # Step 3: Generate image
