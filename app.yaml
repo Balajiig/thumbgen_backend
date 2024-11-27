@@ -9,3 +9,8 @@ automatic_scaling:  # Optional: Configure scaling
   target_cpu_utilization: 0.65
   target_throughput_utilization: 0.75
   max_instances: 5
+
+handlers:
+  - url: /.*  # Match all requests
+    script: auto
+    secure: always  # Forces all traffic to use HTTPS
