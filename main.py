@@ -5,6 +5,7 @@ import re
 from io import BytesIO
 import spacy
 from transformers import pipeline
+from fastapi.middleware.cors import CORSMiddleware
 
 # Load spaCy NLP model
 nlp = spacy.load("en_core_web_sm")
@@ -20,6 +21,17 @@ HUGGING_FACE_API_KEY = "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"  # Replace with y
 
 # FastAPI instance
 app = FastAPI()
+
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Replace "*" with a specific domain (e.g., "http://localhost:3000") for better security
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # Pydantic model for input
 class YouTubeURL(BaseModel):
