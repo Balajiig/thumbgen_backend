@@ -13,7 +13,7 @@ grpcio==1.68.1
 grpcio-status==1.68.1
 h11==0.14.0
 idna==3.10
-numpy==2.2.0
+numpy==1.26.4
 opencv-python-headless==4.10.0.84
 pillow==11.0.0
 proto-plus==1.25.0
