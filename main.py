@@ -1,148 +1,234 @@
-from fastapi import FastAPI, HTTPException, Response
-from pydantic import BaseModel
+import os
+import logging
+import shutil
+import tempfile
+from typing import List, Optional
+
+import cv2
+import numpy as np
 import requests
-import re
-from io import BytesIO
-import spacy
-from transformers import pipeline
+from PIL import Image
+
+import uvicorn
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Load spaCy NLP model
-nlp = spacy.load("en_core_web_sm")
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# YouTube API Configuration
-YOUTUBE_API_KEY = "AIzaSyAAea1lUcPM7BYQmJPC-jpkUzmXocbvBIM"  # Replace with your YouTube API Key
-YOUTUBE_API_URL = "https://www.googleapis.com/youtube/v3/videos"
+# Environment and Configuration
+class Settings:
+    """Application configuration settings"""
+    HUGGING_FACE_API_TOKEN: str = os.getenv('HUGGING_FACE_API_TOKEN', '')
+    MAX_VIDEO_SIZE: int = 50_000_000  # 50 MB
+    FRAME_EXTRACTION_RATE: int = 1  # frame per second
+    THUMBNAIL_SIZE: tuple = (512, 512)
 
-# Hugging Face API details
-HUGGING_FACE_API_URL_SUMMARY = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
-HUGGING_FACE_API_URL_IMAGE = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2"
-HUGGING_FACE_API_KEY = "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"  # Replace with your Hugging Face API Key
+# Video Processing Utilities
+class VideoProcessor:
+    @staticmethod
+    def extract_frames(
+        video_path: str, 
+        output_dir: str, 
+        frame_rate: int = Settings.FRAME_EXTRACTION_RATE
+    ) -> List[str]:
+        """
+        Extract frames from a video at specified frame rate
+        
+        :param video_path: Path to the input video file
+        :param output_dir: Directory to save extracted frames
+        :param frame_rate: Number of frames to extract per second
+        :return: List of extracted frame paths
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        video = cv2.VideoCapture(video_path)
+        
+        if not video.isOpened():
+            raise HTTPException(status_code=400, detail="Could not open video file")
+        
+        fps = int(video.get(cv2.CAP_PROP_FPS))
+        frame_interval = max(1, fps // frame_rate)
+        
+        frames = []
+        frame_id = 0
+        while True:
+            success, frame = video.read()
+            if not success:
+                break
+            
+            if frame_id % frame_interval == 0:
+                frame_path = os.path.join(output_dir, f"frame_{frame_id}.jpg")
+                cv2.imwrite(frame_path, frame)
+                frames.append(frame_path)
+            
+            frame_id += 1
+        
+        video.release()
+        return frames
 
-# FastAPI instance
-app = FastAPI()
+    @staticmethod
+    def create_thumbnail(
+        text: str = "Your Video Thumbnail", 
+        size: tuple = Settings.THUMBNAIL_SIZE
+    ) -> str:
+        """
+        Create a basic thumbnail with text
+        
+        :param text: Text to display on thumbnail
+        :param size: Thumbnail dimensions
+        :return: Path to created thumbnail
+        """
+        thumbnail = np.zeros((*size, 3), dtype=np.uint8)
+        
+        # Add text to thumbnail
+        cv2.putText(
+            thumbnail, 
+            text[:30],  # Limit text length
+            (10, size[1] // 2), 
+            cv2.FONT_HERSHEY_SIMPLEX, 
+            1, 
+            (255, 255, 255), 
+            2, 
+            cv2.LINE_AA
+        )
+        
+        thumbnail_path = os.path.join(tempfile.gettempdir(), "thumbnail.jpg")
+        cv2.imwrite(thumbnail_path, thumbnail)
+        return thumbnail_path
 
+# External API Interaction Utilities
+class ExternalAPIClient:
+    @staticmethod
+    def generate_hooks(
+        summary: str, 
+        api_token: str = Settings.HUGGING_FACE_API_TOKEN
+    ) -> List[str]:
+        """
+        Generate marketing hooks using Hugging Face API
+        
+        :param summary: Summary text to generate hooks from
+        :param api_token: Hugging Face API token
+        :return: List of generated marketing hooks
+        """
+        if not api_token:
+            logger.warning("Hugging Face API token not provided")
+            return ["Learn more about this video!"]
+        
+        API_URL = "https://api-inference.huggingface.co/models/gpt2"
+        headers = {"Authorization": f"Bearer {api_token}"}
+        
+        prompt = f"Generate 3 engaging marketing hooks for a video summary: '{summary}'"
+        payload = {
+            "inputs": prompt, 
+            "parameters": {
+                "max_length": 50, 
+                "num_return_sequences": 3
+            }
+        }
+        
+        try:
+            response = requests.post(API_URL, headers=headers, json=payload, timeout=10)
+            response.raise_for_status()
+            
+            hooks = [hook["generated_text"].strip() for hook in response.json()]
+            return hooks
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Hook generation error: {e}")
+            return ["Discover something amazing!"]
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Replace "*" with a specific domain (e.g., "http://localhost:3000") for better security
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# FastAPI Application Setup
+app = FastAPI(
+    title="Video Thumbnail Generator",
+    description="Generate engaging thumbnails from uploaded videos",
+    version="1.0.0"
 )
 
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
-# Pydantic model for input
-class YouTubeURL(BaseModel):
-    url: str
-
-# Helper function to fetch video metadata using YouTube Data API
-def fetch_youtube_metadata(youtube_url):
-    try:
-        # Extract video ID from the URL
-        video_id = None
-        
-        # Check for standard YouTube URL (https://www.youtube.com/watch?v=<video_id>)
-        match = re.match(r"https?://(?:www\.)?youtube\.com/watch\?v=([a-zA-Z0-9_-]+)", youtube_url)
-        if match:
-            video_id = match.group(1)
-        
-        # Check for shortened YouTube URL (https://youtu.be/<video_id>)
-        if not video_id:
-            match = re.match(r"https?://(?:www\.)?youtu\.be/([a-zA-Z0-9_-]+)", youtube_url)
-            if match:
-                video_id = match.group(1)
-        
-        # If video_id was not found, raise an exception
-        if not video_id:
-            raise HTTPException(status_code=400, detail="Invalid YouTube URL format. Could not extract video ID.")
-        
-        # Make request to YouTube Data API
-        response = requests.get(
-            YOUTUBE_API_URL,
-            params={
-                "part": "snippet",
-                "id": video_id,
-                "key": YOUTUBE_API_KEY
-            }
-        )
-
-        # Debugging: log the response status and body
-        if response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Error fetching metadata. Response: {response.status_code} - {response.text}")
-        
-        data = response.json()
-
-        if "items" in data and data["items"]:
-            video_info = data["items"][0]["snippet"]
-            return {
-                "title": video_info.get("title", "No title available"),
-                "description": video_info.get("description", "No description available")
-            }
-        else:
-            raise HTTPException(status_code=404, detail="Video not found.")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error processing YouTube URL: {str(e)}")
-
-
-
-# Function to summarize and generate prompts
-def summarize_text_to_prompt(description):
+@app.post("/generate-thumbnail/")
+async def generate_thumbnail_api(
+    video: UploadFile = File(..., description="Video file to generate thumbnail from")
+):
     """
-    Summarize a text and convert it into a structured image prompt.
-    """
-    # Step 1: Extract keyphrases using spaCy
-    doc = nlp(description)
-    key_phrases = [chunk.text for chunk in doc.noun_chunks if len(chunk.text.split()) > 1][:3]  # Limit to top 3 phrases
-
-    # Step 2: Generate a short summary (optional)
-    summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-    summary = summarizer(description, max_length=50, min_length=10, do_sample=False)[0]['summary_text']
-
-    # Step 3: Convert to a structured prompt
-    prompt = {
-        "foreground": f"A visually striking depiction of {key_phrases[0]}",
-        "background": f"Complementary setting with elements related to {key_phrases[1]}",
-        "bold_text": summary,
-    }
-
-    return prompt
-
-# Helper function to generate image using Hugging Face API
-def generate_image(prompt):
-    """
-    Generate an image using a structured prompt.
-    """
-    headers = {"Authorization": f"Bearer {HUGGING_FACE_API_KEY}"}
-
-    # Create descriptive prompt text
-    input_prompt = (
-        f"A visually stunning image with the following details:\n"
-        f"Foreground: {prompt['foreground']}.\n"
-        f"Background: {prompt['background']}.\n"
-        f"Bold Text: '{prompt['bold_text']}' prominently displayed in the middle."
-    )
-    payload = {"inputs": input_prompt}
-    response = requests.post(HUGGING_FACE_API_URL_IMAGE, headers=headers, json=payload)
-
-    if response.status_code == 200:
-        return response.content
-    else:
-        raise HTTPException(status_code=500, detail="Error generating the image using Hugging Face API.")
-
-# POST endpoint to process YouTube URL
-@app.post("/process_youtube_url")
-def process_youtube_url(data: YouTubeURL):
-    # Step 1: Fetch metadata
-    metadata = fetch_youtube_metadata(data.url)
-
-    # Step 2: Summarize description
-    summarized_content = summarize_text_to_prompt(metadata["description"])
+    Generate a thumbnail from an uploaded video
     
-    print(summarized_content)
-    # Step 3: Generate image
-    image_bytes = generate_image(summarized_content)
+    - Extracts frames
+    - Generates a marketing hook
+    - Creates a thumbnail with the hook
+    """
+    # Validate file type and size
+    if not video.content_type.startswith('video/'):
+        raise HTTPException(status_code=400, detail="Invalid file type. Must be a video.")
+    
+    # Temporary file and directory management
+    temp_video_path = None
+    frames_dir = None
+    
+    try:
+        # Save uploaded video
+        temp_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        with open(temp_video_path, "wb") as f:
+            f.write(await video.read())
+        
+        # Create temporary directory for frames
+        frames_dir = tempfile.mkdtemp()
+        
+        # Extract frames
+        frames = VideoProcessor.extract_frames(temp_video_path, frames_dir)
+        
+        # Basic frame summary (placeholder for more advanced analysis)
+        frame_summaries = [f"Frame {i}" for i in range(len(frames))]
+        full_summary = " ".join(frame_summaries)
+        
+        # Generate hooks
+        hooks = ExternalAPIClient.generate_hooks(full_summary)
+        prompt = hooks[0] if hooks else "Thumbnail for Your Video"
+        
+        # Create thumbnail
+        thumbnail_path = VideoProcessor.create_thumbnail(prompt)
+        
+        # Return thumbnail
+        return FileResponse(
+            thumbnail_path, 
+            media_type="image/jpeg", 
+            filename="thumbnail.jpg"
+        )
+    
+    except Exception as e:
+        logger.error(f"Thumbnail generation error: {e}")
+        raise HTTPException(status_code=500, detail="Thumbnail generation failed")
+    
+    finally:
+        # Cleanup temporary files
+        if temp_video_path and os.path.exists(temp_video_path):
+            os.remove(temp_video_path)
+        
+        if frames_dir and os.path.exists(frames_dir):
+            shutil.rmtree(frames_dir)
 
-    # Return the image as a PNG file
-    return Response(content=image_bytes, media_type="image/png")
+# Health Check Endpoint
+@app.get("/health")
+async def health_check():
+    """Basic health check endpoint"""
+    return {"status": "healthy"}
+
+# Main block for direct script execution
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=8000, 
+        reload=True
+    )
